@@ -1,0 +1,21 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash HeavenlyPointer</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  body{font-family:system-ui,sans-serif;background:#0c1016;color:#eef2f7;max-width:560px;margin:48px auto;padding:0 20px;text-align:center}
+  a{color:#37c7e6}
+  esp-web-install-button{--esp-tools-button-color:#04222c;--esp-tools-button-background-color:#37c7e6}
+</style></head><body>
+  <h1>🛰 Flash HeavenlyPointer</h1>
+  <p>Plug your Stack-chan (CoreS3) into USB-C, then click Install. Use desktop <b>Chrome</b> or <b>Edge</b>.</p>
+
+  <esp-web-install-button manifest="manifest.json">
+    <span slot="unsupported">Your browser can't flash — use Chrome or Edge on a computer.</span>
+    <span slot="not-allowed">Flashing requires HTTPS.</span>
+  </esp-web-install-button>
+
+  <p style="margin-top:28px;font-size:14px;color:#7b8aa0">
+    Source &amp; docs: <a href="https://github.com/r3dfish/HeavenlyPointer">github.com/r3dfish/HeavenlyPointer</a>
+  </p>
+</body></html>
