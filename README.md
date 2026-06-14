@@ -275,4 +275,3 @@ at infinity, so aiming the display normal along the (az, el) vector is exactly
   TLS certs are not pinned (`setInsecure`) to keep it light on the MCU.
 - The servos are **Feetech serial-bus servos** driven by StackChan-BSP; the head
   geometry constants are sensible defaults but should be confirmed on hardware.
-```
