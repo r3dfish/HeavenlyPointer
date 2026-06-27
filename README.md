@@ -95,22 +95,37 @@ device docs: <https://docs.m5stack.com/en/StackChan>.
 
 ## Install (flash a prebuilt release)
 
-[⚡ Flash from your browser](https://r3dfish.github.io/HeavenlyPointer/)
+Pick whichever is easiest — all three flash the same v1.1.0 image. That single
+image already contains the bootloader, partition table and app; the device
+formats its own filesystem and downloads satellite data on first boot, then drops
+into WiFi setup (see [Using it](#using-it)).
 
-The easiest path — no toolchain needed. Download `HeavenlyPointer-v1.1.0.bin`
-from the **[Releases](https://github.com/r3dfish/HeavenlyPointer/releases)** page and flash it to a CoreS3 over USB-C.
-That single image already contains the bootloader, partition table and app; the
-device formats its own filesystem and downloads satellite data on first boot.
+### M5Burner (GUI, no toolchain)
+
+HeavenlyPointer is published in the **M5Burner** firmware catalog:
+
+1. Download and install **[M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro)** (Windows / macOS / Linux).
+2. Open it and, if prompted, sign in with a free M5Stack account (required to download catalog firmwares).
+3. Find **HeavenlyPointer** — use the search box or the **STACKCHAN** device category.
+4. Click **Download**, then **Burn**.
+5. Connect the CoreS3 over USB-C, select its serial port, leave the baud rate at the default, and click **Burn**.
+6. Wait for the success message — the device reboots into WiFi setup.
+
+### Browser (no install)
+
+[⚡ Flash from your browser](https://r3dfish.github.io/HeavenlyPointer/) with Chrome or
+Edge: plug in the CoreS3 over USB-C, click **Connect**, pick its port, and flash.
+
+### Command line (esptool)
+
+Download `HeavenlyPointer-v1.1.0.bin` from the **[Releases](https://github.com/r3dfish/HeavenlyPointer/releases)** page, then:
 
 ```bash
 # esptool (pip install esptool); add --port /dev/ttyACM0 (Linux/Mac) or COMx (Windows) if needed
 esptool.py --chip esp32s3 --baud 1500000 write_flash 0x0 HeavenlyPointer-v1.1.0.bin
 ```
 
-Prefer a GUI? Use M5Stack's [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro)
-("Custom firmware" → pick the `.bin` → burn at offset `0x0`), or any ESP Web Tools
-browser flasher. After flashing it boots straight into WiFi setup — see
-[Using it](#using-it).
+(You can also point M5Burner's **Custom firmware** at that `.bin` and burn it at offset `0x0`.)
 
 ---
 
