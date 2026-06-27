@@ -24,7 +24,20 @@ bool connect(const String& ssid, const String& pass, uint32_t timeoutMs) {
     while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
         delay(200);
     }
-    return WiFi.status() == WL_CONNECTED;
+    bool ok = (WiFi.status() == WL_CONNECTED);
+    if (ok) {
+        // Good link: re-enable self-heal so a transient AP drop reconnects on its
+        // own (the disable below is scoped to the failure/provisioning teardown,
+        // and is sticky, so it must be undone once we actually connect).
+        WiFi.setAutoReconnect(true);
+    } else {
+        // Tear the failed attempt down: otherwise the STA keeps auto-retrying
+        // the bad credentials in the background, which starves WiFi.scanNetworks()
+        // when we fall back to provisioning (scans come up empty until a reboot).
+        WiFi.disconnect(false, true);     // keep radio on, erase the stored AP config
+        WiFi.setAutoReconnect(false);
+    }
+    return ok;
 }
 
 time_t nowUtc() {

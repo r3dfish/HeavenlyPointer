@@ -57,6 +57,7 @@ namespace Sky {
     // while parked) and count down to aosUnix locally between calls.
     struct NextPass {
         bool   valid   = false;
+        bool   inReach = true; // false = soonest pass but outside the head's reach arc
         char   name[28] = {0};
         time_t aosUnix = 0;   // unix UTC when it rises above the min elevation
         double maxEl   = 0;   // peak elevation of that pass (deg)

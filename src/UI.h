@@ -16,16 +16,31 @@ namespace UI {
     // ----- Provisioning screen ----------------------------------------------
     // Draws the join-QR + instructions and a "Touch keyboard" button.
     // Returns true if that button was tapped this frame.
-    bool drawProvision(const char* joinQr, const char* portalUrl, const char* apSsid);
+    // Provisioning screen. showOffline adds an "Offline mode" button (only when
+    // cached data makes offline tracking possible). Returns 1 if Touch-entry was
+    // tapped, 2 if Offline mode, else 0.
+    int drawProvision(const char* joinQr, const char* portalUrl, const char* apSsid, bool showOffline);
+    // Forces drawProvision to fully repaint on its next call. Call once when
+    // (re)entering the portal so a stale paint-cache can't hide the controls.
+    void resetProvisionCache();
 
     // Blocking on-device WiFi entry. Returns true and fills ssid/pass if the
     // user completed entry; false if they backed out.
     bool pickSSID(String& ssidOut);                       // scan + tap to pick
-    String keyboard(const char* title, bool password);    // on-screen QWERTY
+    // On-screen QWERTY. rightLabel (optional) is shown right-aligned on the
+    // title row - used to show which network the password is for. If cancelled
+    // is non-null, a Back button is shown; on tap it sets *cancelled=true and
+    // returns "".
+    String keyboard(const char* title, bool password, const char* rightLabel = nullptr,
+                    bool* cancelled = nullptr);
 
     // ----- Calibration screen -----------------------------------------------
     // Blocks until the user taps a compass direction. Returns the choice.
     Facing askFacing();
+
+    // Magnetometer calibration progress (0..1). Non-blocking; call each frame
+    // while the user rotates the device through a full turn.
+    void drawCompassCal(float progress);
 
     // ----- Tracking HUD -----------------------------------------------------
     // Non-blocking: paints the current tracking state. Call each tick.

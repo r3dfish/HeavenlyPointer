@@ -74,7 +74,8 @@ void scanNetworks() {
         if (s_ssidOptions.indexOf(tag) >= 0) continue;       // already listed
         s_ssidOptions += "<option>" + htmlEscape(s) + "</option>";
     }
-    if (n > 0) WiFi.scanDelete();
+    // Keep the raw results in memory (we're in WIFI_AP_STA) so the on-screen
+    // touch picker can reuse THIS scan instead of running a second one.
 }
 
 String buildForm() {
@@ -84,7 +85,9 @@ String buildForm() {
     h += s_ssidOptions;
     h += "<option value=''>Other / hidden network&hellip;</option></select>";
     h += "<input name=\"ssidother\" id=\"oth\" placeholder=\"Network name\" style=\"" + othStyle + "\">";
-    h += "<small><a href=\"/rescan\" style=\"color:#3cc\">&#8635; Rescan networks</a></small>";
+    h += "<a href=\"/rescan\" style=\"display:block;text-align:center;padding:11px;margin:8px 0;"
+         "border-radius:6px;background:#243b44;color:#9eeaff;text-decoration:none;font-size:15px\">"
+         "&#8635; Rescan networks</a>";
     h += FORM_TAIL;
     return h;
 }
@@ -121,14 +124,19 @@ void handleSave() {
 
 } // anonymous namespace
 
-bool run() {
+bool run(bool offlineCapable) {
     captured = false; capHasLoc = false;
+    bool offline = false;
+    UI::resetProvisionCache();            // force a fresh paint, even on re-entry
 
     WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, true);         // drop any leftover STA connect (e.g. after a wrong
+    WiFi.setAutoReconnect(false);         // password) so the scanner isn't starved
     WiFi.softAP(AP_SSID);                 // open network
     IPAddress ip = WiFi.softAPIP();       // typically 192.168.4.1
 
     UI::status("Scanning WiFi...", TFT_YELLOW);
+    delay(150);                           // let the radio settle after the disconnect
     scanNetworks();                       // site survey for the setup form's list
 
     dns.start(53, "*", ip);               // captive-portal DNS catch-all
@@ -144,29 +152,45 @@ bool run() {
     String joinQr  = String("WIFI:T:nopass;S:") + AP_SSID + ";;";
     String portalUrl = String("http://") + ip.toString();
 
-    while (!captured) {
+    while (!captured && !offline) {
         dns.processNextRequest();
         server.handleClient();
 
-        // Touch-entry path. drawProvision returns true when its button is hit.
-        if (UI::drawProvision(joinQr.c_str(), portalUrl.c_str(), AP_SSID)) {
-            String ssid;
-            UI::pickSSID(ssid);
-            if (ssid.isEmpty()) ssid = UI::keyboard("Enter WiFi name (SSID)", false);
-            String pass = UI::keyboard("Password", true);
-            capSsid = ssid; capPass = pass; captured = true;
-            break;
+        // drawProvision returns: 1 = Touch entry, 2 = Offline mode, else 0.
+        int action = UI::drawProvision(joinQr.c_str(), portalUrl.c_str(), AP_SSID, offlineCapable);
+        if (action == 1) {
+            // Sub-flow: pick network -> password. The password screen's Back
+            // button returns here so a wrong network can be re-picked.
+            while (true) {
+                String ssid;
+                UI::pickSSID(ssid);
+                if (ssid.isEmpty()) ssid = UI::keyboard("Enter WiFi name (SSID)", false);
+                if (ssid.isEmpty()) break;            // backed out -> return to QR screen
+                bool cancelled = false;
+                String pass = UI::keyboard("Password", true, ssid.c_str(), &cancelled);
+                if (cancelled) continue;              // wrong network -> re-pick
+                capSsid = ssid; capPass = pass; captured = true;
+                break;
+            }
+        } else if (action == 2) {
+            offline = true;                           // run on cached data, no WiFi
         }
         delay(5);
     }
 
-    // Tear down the AP & servers before we switch to station mode.
+    // Tear down the AP & servers before we leave the portal.
     server.stop();
     dns.stop();
     WiFi.softAPdisconnect(true);
+
+    if (offline) {                                    // keep saved creds untouched
+        WiFi.mode(WIFI_OFF);                          // no radio needed offline -> saves power
+        UI::status("Starting offline...", TFT_CYAN);
+        return true;
+    }
     WiFi.mode(WIFI_STA);
 
-    // Persist into the global settings.
+    // Persist captured credentials.
     settings.ssid = capSsid;
     settings.pass = capPass;
     if (capHasLoc) {
@@ -176,7 +200,7 @@ bool run() {
     settings.save();
 
     UI::status("WiFi saved", TFT_GREEN);
-    return true;
+    return false;
 }
 
 } // namespace Provision

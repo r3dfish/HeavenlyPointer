@@ -8,7 +8,10 @@
 #include "Status.h"
 #include "Sky.h"
 #include "ServoHead.h"
+#include "ServoSetup.h"
+#include "Compass.h"
 #include "Net.h"
+#include <M5Unified.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
@@ -42,6 +45,12 @@ int hhmmToMin(const String& s) {
 // ---- GET / : the control page (served straight from flash) ----------------
 void handleIndex() {
     server.send_P(200, "text/html", INDEX_HTML);
+}
+
+// ---- favicon (SVG) : keeps the tab icon nice + avoids 302-ing /favicon.ico -
+void handleFavicon() {
+    server.sendHeader("Cache-Control", "max-age=86400");
+    server.send_P(200, "image/svg+xml", FAVICON_SVG);
 }
 
 // ---- GET /status.json : live tracking telemetry ---------------------------
@@ -80,6 +89,10 @@ void handleStatus() {
 
     d["sleeping"]  = g_sleepNow;
     d["testMode"]  = g_testMode;
+    d["lowBattery"]= g_lowBattery;
+    d["stalled"]   = g_stalled;
+    d["battLevel"] = M5.Power.getBatteryLevel();
+    d["charging"]  = (M5.Power.isCharging() != m5::Power_Class::is_discharging);
     if (g_testMode) {   // actual bus read-back, for the motor-test diagnostic
         d["panCmd"]  = ServoHead::panAngle();
         d["tiltCmd"] = ServoHead::tiltAngle();
@@ -90,9 +103,20 @@ void handleStatus() {
     d["geoCity"]   = g_geoCity;
     d["lat"]       = settings.lat;
     d["lon"]       = settings.lon;
-    d["hasNext"] = g_status.hasNext;
+
+    // Heading / compass live state
+    d["headSource"]  = settings.headingSource;     // 0 manual, 1 auto
+    d["headAuto"]    = g_heading.autoActive;        // auto source AND good fix in use
+    d["magPresent"]  = g_heading.magPresent;
+    d["headTrue"]    = g_heading.forwardTrue;       // applied forward bearing (deg true)
+    d["headMag"]     = g_heading.magHeading;        // last magnetometer heading (deg)
+    d["declination"] = g_heading.declination;
+    d["headTilt"]    = g_heading.tilt;
+    d["headQual"]    = g_heading.quality;
+    d["hasNext"]     = g_status.hasNext;       // a reachable pass to count down to
+    d["nextInReach"] = g_status.nextInReach;
+    d["nextName"]    = g_status.nextName;
     if (g_status.hasNext) {
-        d["nextName"] = g_status.nextName;
         time_t n = Net::nowUtc();
         long secs = (n > 0) ? (long)(g_status.nextAos - n) : 0;
         d["nextInSec"] = secs < 0 ? 0 : secs;
@@ -121,6 +145,13 @@ void handleConfigJson() {
     d["sleepStart"]   = minToHHMM(settings.sleepStartMin);
     d["sleepEnd"]     = minToHHMM(settings.sleepEndMin);
     d["facing"]       = facingName(settings.facing);
+    d["headingSource"]    = settings.headingSource;
+    d["manualHeading"]    = settings.manualHeadingDeg;
+    d["headingOffset"]    = settings.headingOffsetDeg;
+    d["declination"]      = settings.declinationDeg;
+    d["declinationManual"]= settings.declinationManual;
+    d["magPresent"]       = Compass::available();
+    d["magCalDone"]       = settings.magCalDone;
     d["hasLocation"]  = settings.hasLocation;
     d["lat"]          = settings.lat;
     d["lon"]          = settings.lon;
@@ -189,6 +220,10 @@ void handleConfigPost() {
     }
     if (server.hasArg("sleepstart")) settings.sleepStartMin = hhmmToMin(server.arg("sleepstart"));
     if (server.hasArg("sleepend"))   settings.sleepEndMin   = hhmmToMin(server.arg("sleepend"));
+    // The form re-submits every heading field on each save, so flag a heading
+    // re-apply ONLY when a value actually changes - otherwise an unrelated edit
+    // would trigger a blocking ~200ms magnetometer re-read in AUTO mode.
+    bool headingChanged = false;
     if (server.hasArg("facing")) {
         String fc = server.arg("facing"); fc.toUpperCase();
         Facing nf = settings.facing;
@@ -196,8 +231,37 @@ void handleConfigPost() {
         else if (fc.startsWith("E")) nf = FACE_EAST;
         else if (fc.startsWith("S")) nf = FACE_SOUTH;
         else if (fc.startsWith("W")) nf = FACE_WEST;
+        if (nf != settings.facing || !settings.hasFacing) headingChanged = true;
         settings.facing = nf; settings.hasFacing = true;
-        ServoHead::setFacing(nf);
+    }
+    if (server.hasArg("hsrc")) {
+        uint8_t ns = (server.arg("hsrc").toInt() == 1) ? HEADING_AUTO : HEADING_MANUAL;
+        if (ns != settings.headingSource) { settings.headingSource = ns; headingChanged = true; }
+    }
+    if (server.hasArg("mhead")) {              // precise manual bearing; blank = use N/E/S/W
+        String v = server.arg("mhead"); v.trim();
+        float nh = -1.0f;
+        if (v.length()) { nh = v.toFloat(); while (nh < 0) nh += 360.0f; while (nh >= 360) nh -= 360.0f; }
+        if (fabsf(nh - settings.manualHeadingDeg) > 0.01f) { settings.manualHeadingDeg = nh; headingChanged = true; }
+    }
+    if (server.hasArg("hoff")) {               // magnetometer mounting trim
+        float o = server.arg("hoff").toFloat();
+        while (o < -180) o += 360.0f; while (o > 180) o -= 360.0f;
+        if (fabsf(o - settings.headingOffsetDeg) > 0.01f) { settings.headingOffsetDeg = o; headingChanged = true; }
+    }
+    if (server.hasArg("declauto")) {           // checkbox: auto-compute declination from WMM
+        String s = server.arg("declauto");
+        bool man = !(s == "1" || s == "true" || s == "on");
+        if (man != settings.declinationManual) { settings.declinationManual = man; headingChanged = true; }
+    }
+    // Honor a typed declination only in manual mode (the field is auto-filled +
+    // disabled when auto is on, so we must not let its value flip us to manual).
+    if (server.hasArg("decl") && settings.declinationManual) {
+        String v = server.arg("decl"); v.trim();
+        if (v.length()) {
+            float d = v.toFloat();
+            if (fabsf(d - settings.declinationDeg) > 0.01f) { settings.declinationDeg = d; headingChanged = true; }
+        }
     }
     if (server.hasArg("lat") && server.hasArg("lon")) {
         String la = server.arg("lat"), lo = server.arg("lon");
@@ -221,7 +285,8 @@ void handleConfigPost() {
     ServoHead::setLimits(settings.panLimit, settings.minElevation, settings.maxElevation);
 
     settings.save();
-    if (groupChanged) g_tleRefetchNeeded = true;   // heavy refetch deferred to trackTick
+    if (groupChanged)    g_tleRefetchNeeded = true;   // heavy refetch deferred to trackTick
+    if (headingChanged)  g_applyHeadingNeeded = true;  // re-point "forward" in the main loop
     sendJson(200, "{\"ok\":true}");
 }
 
@@ -231,6 +296,7 @@ void handleTest() {
         float pan  = server.hasArg("pan")  ? server.arg("pan").toFloat()  : ServoHead::panAngle();
         float tilt = server.hasArg("tilt") ? server.arg("tilt").toFloat() : ServoHead::tiltAngle();
         ServoHead::testMove(pan, tilt);
+        g_lastTestCmdMs = millis();          // reset the test-mode auto-relax timer
     }
     sendJson(200, "{\"ok\":true}");
 }
@@ -245,9 +311,12 @@ void handleAction() {
     else if (cmd == "prev")     Sky::selectPrev();
     else if (cmd == "sleep")    g_sleepNow = true;
     else if (cmd == "wake")     g_sleepNow = false;
-    else if (cmd == "test")     { g_testMode = true; g_sleepNow = false; }
+    else if (cmd == "test")     { g_testMode = true; g_sleepNow = false; g_lastTestCmdMs = millis(); }
     else if (cmd == "testexit") g_testMode = false;
     else if (cmd == "recover")  ServoHead::recover();
+    else if (cmd == "calmag")   g_calibrateMagNeeded = true;   // run compass calibration
+    else if (cmd == "applyhead")g_applyHeadingNeeded = true;   // re-read heading now
+    else if (cmd == "servosetup") { sendJson(200, "{\"ok\":true}"); ServoSetup::requestAndReboot(); return; }
     sendJson(200, "{\"ok\":true}");
 }
 
@@ -262,6 +331,8 @@ void handleNotFound() {
 void begin() {
     if (s_started) return;
     server.on("/",            HTTP_GET,  handleIndex);
+    server.on("/favicon.svg", HTTP_GET,  handleFavicon);
+    server.on("/favicon.ico", HTTP_GET,  handleFavicon);   // serve the SVG here too
     server.on("/status.json", HTTP_GET,  handleStatus);
     server.on("/config.json", HTTP_GET,  handleConfigJson);
     server.on("/config",      HTTP_POST, handleConfigPost);

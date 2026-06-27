@@ -19,6 +19,7 @@ struct LiveStatus {
 
     // Next-pass countdown (populated while parked / searching)
     bool   hasNext = false;
+    bool   nextInReach = true; // false = soonest pass is outside the reach arc
     char   nextName[28] = {0};
     time_t nextAos = 0;        // unix UTC of the next AOS
 };
@@ -28,12 +29,31 @@ extern LiveStatus g_status;
 // Requests raised by the web UI, consumed (and cleared) in trackTick():
 extern bool g_tleRefetchNeeded;   // re-download the TLE catalog (group changed)
 extern bool g_relocateNeeded;     // re-run IP geolocation
+extern bool g_calibrateMagNeeded; // run the magnetometer calibration routine
+extern bool g_applyHeadingNeeded; // re-apply the forward bearing (heading settings changed)
+
+// Live heading state (for the web page + diagnostics overlay).
+struct HeadingState {
+    bool  autoActive = false;   // AUTO source AND a good magnetometer fix is in use
+    bool  magPresent = false;   // a magnetometer was detected
+    float forwardTrue = 0;      // forward bearing currently applied (deg true north)
+    float magHeading = 0;       // last magnetometer MAGNETIC heading (deg)
+    float declination = 0;      // declination applied (deg E)
+    float tilt = 0;             // head tilt from level (deg) at last read
+    float quality = 0;          // 0..100 last read quality
+};
+extern HeadingState g_heading;
 
 // Desired sleep state - toggled by the SLEEP/WAKE button and the schedule.
 extern bool g_sleepNow;
 
 // Motor-test mode: pauses tracking; servos driven directly by the web /test.
 extern bool g_testMode;
+extern uint32_t g_lastTestCmdMs;  // millis() of the last /test command (for auto-relax)
+
+// Servo-protection state (for the web page).
+extern bool g_lowBattery;   // on battery and below LOW_BATT_PCT -> servos relaxed
+extern bool g_stalled;      // last aim couldn't reach target (jam) -> servos relaxed
 
 // Result of the last IP-geolocation attempt (shown on the web page).
 enum GeoStatus : int { GEO_NONE = 0, GEO_OK = 1, GEO_FAIL = 2 };

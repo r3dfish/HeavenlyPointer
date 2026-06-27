@@ -21,6 +21,12 @@ void Settings::load() {
     tzManual     = p.getBool("tzman", false);
     facing       = (Facing)p.getUChar("facing", FACE_NORTH);
     hasFacing    = p.getBool("hasface", false);
+    headingSource    = p.getUChar("hsrc", HEADING_MANUAL);
+    manualHeadingDeg = p.getFloat("mhead", -1.0f);
+    headingOffsetDeg = p.getFloat("hoff", 0.0f);
+    declinationDeg   = p.getFloat("decl", 0.0f);
+    declinationManual = p.getBool("declman", false);
+    magCalDone       = p.getBool("magcal", false);
     tleGroup     = p.getString("tlegrp", DEFAULT_TLE_GROUP);
     tleFetchedAt = p.getUInt("tleat", 0);
     minElevation = p.getDouble("minel", 5.0);
@@ -48,6 +54,12 @@ void Settings::save() {
     p.putBool("tzman", tzManual);
     p.putUChar("facing", (uint8_t)facing);
     p.putBool("hasface", hasFacing);
+    p.putUChar("hsrc", headingSource);
+    p.putFloat("mhead", manualHeadingDeg);
+    p.putFloat("hoff", headingOffsetDeg);
+    p.putFloat("decl", declinationDeg);
+    p.putBool("declman", declinationManual);
+    p.putBool("magcal", magCalDone);
     p.putString("tlegrp", tleGroup);
     p.putUInt("tleat", tleFetchedAt);
     p.putDouble("minel", minElevation);

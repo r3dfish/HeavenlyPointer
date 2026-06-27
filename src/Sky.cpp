@@ -127,7 +127,18 @@ static Target computeTarget(int i, time_t now) {
     t.subLon  = s_sat.satLon;
     t.altKm   = s_sat.satAlt;
     t.vis     = s_sat.satVis;
-    t.velKms  = sqrt(MU_EARTH / (RE_EARTH + max(1.0, t.altKm)));   // circular-orbit estimate
+    // Instantaneous orbital speed via the vis-viva equation, with the
+    // semi-major axis derived from the TLE mean motion. This accounts for
+    // orbital eccentricity (a plain circular estimate sqrt(GM/r) does not).
+    // (SGP4 computes the exact velocity vector internally, but the library
+    // keeps it private, so vis-viva is the most accurate value we can read.)
+    {
+        double r = RE_EARTH + max(1.0, t.altKm);              // geocentric distance, km
+        double n = e.mm * 6.283185307179586 / 86400.0;        // mean motion, rad/s
+        double a = (n > 1e-9) ? cbrt(MU_EARTH / (n * n)) : r; // semi-major axis, km
+        double term = 2.0 / r - 1.0 / a;
+        t.velKms = sqrt(MU_EARTH * (term > 0.0 ? term : 1.0 / r));
+    }
     t.valid   = true;
     return t;
 }
@@ -199,7 +210,9 @@ void selectPrev() { cycleTarget(-1); }
 // Find the first moment inside a pass window [jdStart, jdStop] when the sat is
 // actually REACHABLE (within the az/el limits). Returns its Julian date, or -1
 // if the head can never point at this pass. (~20 s sampling.)
-static double firstReachableJd(double jdStart, double jdStop) {
+static double firstReachableJd(double jdStart, double jdStop, double jdNow) {
+    if (jdStart < jdNow) jdStart = jdNow;   // only count FUTURE moments - a pass already
+                                            // in progress has its AOS in the past
     const double stepJd = 20.0 / 86400.0;   // 20 seconds
     for (double jd = jdStart; jd <= jdStop + 1e-9; jd += stepJd) {
         unsigned long ut = (unsigned long)((jd - 2440587.5) * 86400.0);
@@ -211,7 +224,10 @@ static double firstReachableJd(double jdStart, double jdStop) {
 
 NextPass computeNextPass(time_t now) {
     NextPass best;
-    double bestJd = 1e18;
+    const double jdNow = (double)now / 86400.0 + 2440587.5;  // unix -> Julian date
+    double bestReachJd = 1e18;          // soonest pass the head can actually point at
+    double bestAnyJd   = 1e18;          // soonest pass at all (for the empty-state hint only)
+    char   anyName[28] = {0};
     for (int i = 0; i < s_count; i++) {
         if (orbitFiltered(s_cat[i])) continue;
         if (!passesFilter(s_cat[i].name)) continue;
@@ -219,24 +235,33 @@ NextPass computeNextPass(time_t now) {
         s_sat.init(e.name, e.l1, e.l2);
         s_sat.initpredpoint((unsigned long)now, s_minEl);
 
-        // Collect this sat's next few pass windows first (sequential nextpass
-        // calls), THEN scan them for reachability with findsat() - so findsat
-        // never runs between two nextpass() calls and can't disturb its cursor.
-        double ws[3], we[3], wmax[3];
+        // Only this sat's NEXT pass - across the whole catalog that's enough to
+        // find the soonest reachable one, and it keeps this (heavy) call cheap.
+        // (nextpass returns TRUE on success.)
+        double ws[1], we[1], wmax[1];
         int nw = 0;
-        for (int p = 0; p < 3; p++) {
+        {
             passinfo pass;
-            if (s_sat.nextpass(&pass, 20)) break;          // no more passes
-            ws[nw] = pass.jdstart; we[nw] = pass.jdstop; wmax[nw] = pass.maxelevation; nw++;
+            if (s_sat.nextpass(&pass, 20)) {
+                ws[0] = pass.jdstart; we[0] = pass.jdstop; wmax[0] = pass.maxelevation; nw = 1;
+            }
         }
+
+        // Track the soonest pass overall (reachable or not) - used ONLY to tell
+        // "no passes at all" from "passes exist but out of reach" in the empty state.
+        if (nw > 0 && ws[0] < bestAnyJd) {
+            bestAnyJd = ws[0];
+            strncpy(anyName, e.name, sizeof(anyName) - 1); anyName[sizeof(anyName) - 1] = 0;
+        }
+
         // Some passes rise above the horizon but stay outside the pan/elevation
         // reach, so they'd never be tracked - find the first reachable one.
         for (int w = 0; w < nw; w++) {
-            double jdReach = firstReachableJd(ws[w], we[w]);
-            if (jdReach < 0) continue;                     // window never in reach
-            if (jdReach < bestJd) {
-                bestJd = jdReach;
-                best.valid = true;
+            double jdReach = firstReachableJd(ws[w], we[w], jdNow);
+            if (jdReach < 0) continue;                     // window never in reach (in future)
+            if (jdReach < bestReachJd) {
+                bestReachJd = jdReach;
+                best.valid = true; best.inReach = true;
                 strncpy(best.name, e.name, sizeof(best.name) - 1);
                 best.name[sizeof(best.name) - 1] = 0;
                 best.maxEl   = wmax[w];
@@ -244,6 +269,13 @@ NextPass computeNextPass(time_t now) {
             }
             break;                                         // got this sat's next reachable pass
         }
+    }
+    // We only ever count down to passes we can POINT at. If none are reachable
+    // but passes do exist, record that (name only, no AOS -> no countdown) so the
+    // UI can say "out of reach" instead of "no passes". valid stays false.
+    if (!best.valid && bestAnyJd < 1e17) {
+        best.inReach = false;
+        strncpy(best.name, anyName, sizeof(best.name) - 1); best.name[sizeof(best.name) - 1] = 0;
     }
     return best;
 }

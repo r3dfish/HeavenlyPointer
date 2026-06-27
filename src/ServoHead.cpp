@@ -48,7 +48,14 @@ void begin() {
     M5StackChan.Motion.move(s_lastYawT, s_lastPitchT, SERVO_SPEED);
 }
 
-void setFacing(Facing f) { s_forwardBearing = facingBearing(f); }
+void setForwardBearing(float trueBearingDeg) {
+    while (trueBearingDeg < 0.0f)    trueBearingDeg += 360.0f;
+    while (trueBearingDeg >= 360.0f) trueBearingDeg -= 360.0f;
+    s_forwardBearing = trueBearingDeg;
+}
+float forwardBearing() { return s_forwardBearing; }
+
+void setFacing(Facing f) { setForwardBearing(facingBearing(f)); }
 
 void setLimits(float panLimitDeg, float elMinDeg, float elMaxDeg) {
     s_panLimitDeg = panLimitDeg;

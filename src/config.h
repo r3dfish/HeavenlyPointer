@@ -8,7 +8,7 @@
 #pragma once
 
 // Firmware version (shown on the boot splash). Bump this per release.
-#define FW_VERSION "v1.0.0"
+#define FW_VERSION "v1.1.0"
 
 // ---------------------------------------------------------------------------
 //  Head / servo geometry  (StackChan-BSP serial-bus servos)
@@ -48,6 +48,16 @@ constexpr int PITCH_MAX_TENTHS     = 850;  // safe ceiling (85 deg) - product li
 
 // BSP motion smoothing speed (0..1000). Higher = snappier head movement.
 constexpr int SERVO_SPEED = 250;
+
+// --- Servo-protection guards (defense-in-depth against a burnout) -----------
+// A held servo fighting gravity is what cooked the original tilt motor; these
+// cut torque before sustained load can damage a servo.
+#define TEST_IDLE_RELAX_MS   30000U   // motor-test: relax if no command for this long
+#define LOW_BATT_PCT         20       // relax + warn below this battery % while on battery
+#define STALL_GAP_DEG        25.0f    // commanded-vs-actual gap that may mean a jam
+#define STALL_MOVE_DEG       2.5f     // actual moving less than this between ticks = "stuck"
+#define STALL_HOLD_MS        5000U    // gap+stuck must persist this long to trip a stall
+#define STALL_COOLDOWN_MS    20000U   // stay limp this long after a stall trip, then retry
 
 // ---------------------------------------------------------------------------
 //  Tracking behaviour
@@ -128,3 +138,18 @@ inline const char* facingName(Facing f) {
     switch (f) { case FACE_NORTH: return "NORTH"; case FACE_EAST: return "EAST";
                  case FACE_SOUTH: return "SOUTH"; default: return "WEST"; }
 }
+
+// How the head's "forward" bearing is determined.
+//   MANUAL = the N/E/S/W tap (or a typed bearing) you set by hand.
+//   AUTO   = read it from the on-board magnetometer (true-north corrected).
+enum HeadingSource : uint8_t { HEADING_MANUAL = 0, HEADING_AUTO = 1 };
+
+// Magnetometer reads are only trusted when the head is level within this much
+// (degrees). Beyond it, AUTO heading is flagged low-quality and we hold manual.
+// Max gap between taps for the 4-tap standby/wake gesture (ms).
+#define QUAD_TAP_GAP_MS        700U
+
+#define COMPASS_MAX_TILT_DEG   35.0f
+// Calibration is considered good once the user has swept the head through this
+// many of 12 thirty-degree heading sectors during the figure-8.
+#define COMPASS_CAL_SECTORS    10

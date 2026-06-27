@@ -60,18 +60,51 @@ device docs: <https://docs.m5stack.com/en/StackChan>.
 
 ---
 
+## What's new in v1.1.0
+
+- **Magnetometer auto-heading** — let the on-board compass figure out which way
+  "forward" is instead of tapping N/E/S/W, with **offline magnetic→true-north
+  correction** (embedded World Magnetic Model 2025, NOAA-verified). Manual facing
+  is always available as a fallback, and a poor/absent fix auto-reverts to it.
+- **On-screen servo tools** — set a replacement servo's **bus ID** (pan 1 / tilt 2)
+  and **re-zero "forward/level"** (Set center) right on the device — no external
+  Feetech programmer needed.
+- **Servo-protection guards** — defense-in-depth against the burnout: torque is
+  released when idle/asleep, the motor-test holds auto-relax after 30 s, a **stall
+  guard** cuts torque if the head is jammed, and a **low-battery guard** relaxes +
+  warns below 20 % on battery.
+- **Reach-aware countdown** — the next-pass timer now counts down **only to passes
+  the head can actually point at**; if the soonest pass is outside the reach arc it
+  says so (and to widen limits / check facing) instead of misleading you.
+- **Smoother WiFi setup** — instant cached network list with a working Rescan,
+  show/hide password, a **Back** button, the chosen network shown on the password
+  screen, and clean recovery from a wrong password (no reboot needed).
+- **Offline mode** — out of WiFi range but the data's already cached? The setup
+  screen now offers an **Offline mode** button that tracks on the **cached TLEs +
+  saved location + RTC clock**, no WiFi required. A failed connection also no
+  longer wipes your saved WiFi, so it reconnects automatically once you're home.
+- **4-tap standby** — **four quick taps** anywhere on the screen drops the device
+  into standby (head goes limp, screen + LEDs off, WiFi stays up); **four more taps
+  wake it**. Works alongside the web SLEEP/WAKE button and the sleep schedule.
+- **Footer** — local **date** and **battery %** added to the on-screen footer.
+- **Readouts** — range & altitude show in **miles**, **velocity in mph**, and
+  velocity is now computed with the **vis-viva equation** (accounts for orbital
+  eccentricity) instead of a circular-orbit estimate.
+
+---
+
 ## Install (flash a prebuilt release)
 
 [⚡ Flash from your browser](https://r3dfish.github.io/HeavenlyPointer/)
 
-The easiest path — no toolchain needed. Download `HeavenlyPointer-v1.0.0.bin`
+The easiest path — no toolchain needed. Download `HeavenlyPointer-v1.1.0.bin`
 from the **[Releases](https://github.com/r3dfish/HeavenlyPointer/releases)** page and flash it to a CoreS3 over USB-C.
 That single image already contains the bootloader, partition table and app; the
 device formats its own filesystem and downloads satellite data on first boot.
 
 ```bash
 # esptool (pip install esptool); add --port /dev/ttyACM0 (Linux/Mac) or COMx (Windows) if needed
-esptool.py --chip esp32s3 --baud 1500000 write_flash 0x0 HeavenlyPointer-v1.0.0.bin
+esptool.py --chip esp32s3 --baud 1500000 write_flash 0x0 HeavenlyPointer-v1.1.0.bin
 ```
 
 Prefer a GUI? Use M5Stack's [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro)
@@ -125,6 +158,33 @@ the live `pan`/`tilt` readout on the tracking screen to dial these in:
 > Angles are in **1/10-degree units** to match StackChan-BSP (e.g. `900` = 90°).
 > The BSP runs its own smoothing engine, so there's no slew/tick tuning to do.
 
+### Replacing a servo (bus IDs)
+
+The Stack-chan's Feetech serial-bus servos are addressed by **ID**: the pan
+servo must be **ID 1**, the tilt servo **ID 2**. The firmware does *not* assign
+IDs, and a brand-new servo ships as **ID 1** — so a replacement (especially the
+tilt servo) must be re-IDed or that axis won't respond (it shows **NO RESPONSE**
+in the Motor test, the same symptom as a dead servo).
+
+Built-in tool — no external Feetech programmer needed: web UI → **Actions →
+Servo ID setup**, which reboots into an on-screen tool that scans the bus and
+lets you set the connected servo to ID 1 or 2.
+
+> **Important:** servos sharing an ID are indistinguishable on the bus, so when
+> changing an ID, **connect only the one servo you're changing** (unplug the
+> other), set it, then reconnect the other and verify both in **Motor test**.
+
+**Re-centering ("zero").** Each axis stores a *zero* shaft position in NVS
+(defaults: yaw 460, tilt 620 raw counts); commanding 0° drives the servo's
+**absolute** sensor to that count, so "forward/level" is repeatable across
+reboots with no homing. A replacement servo keeps the stored zero, but its
+sensor offset (and how the head seats on the toothed output spline) can shift
+where 0° actually points. With **both** servos connected, hand-aim the head to
+forward + level and tap **Set center** in the Servo ID tool — it captures the
+current positions as the new zero (saved to the same NVS the BSP reads at boot),
+so you don't have to hand-edit `PITCH_HORIZON_TENTHS` / facing. Fine-trim with
+those `config.h` constants afterward if needed.
+
 ---
 
 ## Using it
@@ -132,10 +192,12 @@ the live `pan`/`tilt` readout on the tracking screen to dial these in:
 | Step | What you see / do |
 |---|---|
 | First boot | QR code + "WiFi Setup". Scan & enter creds, or tap **Touch entry**. |
+| Out of WiFi range | If it can't reach a saved network but already has cached data (TLEs + location + a valid clock), the setup screen shows an **Offline mode** button — tap it to track on cached data with no WiFi. Your saved WiFi is kept, so it reconnects automatically back home. |
 | After connect | "Syncing time", "Finding location", "Downloading satellite data". |
-| Calibrate | Tap the compass direction the face points. (Asked once.) |
+| Calibrate | Tap the compass direction the face points. (Asked once.) Or switch to **Auto** heading in the web UI to use the magnetometer instead — see Heading below. |
 | Tracking | Satellite name + telemetry + sky plot. The head moves to follow it. Tap the **top-left/top-right corners** to browse prev/next visible satellite. |
-| "Scanning the sky" | Nothing is above the horizon yet — it homes the head, **releases the servo torque** (so the tilt motor isn't holding the head up against gravity), and shows a **countdown to the next pass** (which satellite + HH:MM:SS until it rises, and its peak elevation). The head re-energizes automatically when the next satellite rises. |
+| Standby | **Tap the screen 4 times quickly** (away from the browse corners) to drop into standby — head limp, screen + LEDs off, WiFi still up. **Four more quick taps** wake it. |
+| "Scanning the sky" | Nothing is above the horizon yet — it homes the head, **releases the servo torque** (so the tilt motor isn't holding the head up against gravity), and counts down to the **next pass it can actually point at** (satellite + HH:MM:SS + peak elevation). If the soonest pass is **outside the reach arc**, it says "out of reach" (widen limits / check facing) rather than counting down to something it can't track. The head re-energizes when a reachable satellite rises. |
 | Reset | Press-and-hold the bottom of the screen ~3 s to wipe config & re-provision. |
 
 ### Name-bar colour = optical visibility
@@ -169,16 +231,17 @@ device:
 | **Name filter** | Track only satellites whose name contains this text (e.g. `ISS`, `NOAA`, `STARLINK`). Blank = everything. |
 | **Reach limits** | Min/max elevation and azimuth (pan ±°) the head can point at. The tracker **only selects satellites inside these limits** — and if the one it's following drifts out of range, it **automatically switches to the next in-range satellite** (or parks if none is reachable). |
 | **Orbit class** | `LEO only` (default — fast passes that sweep the sky), `Skip geostationary` (LEO + MEO), or `All orbits`. Classified by mean motion: LEO ≥ 11.25, MEO ~2, GEO ~1 rev/day. |
-| **Facing** | Re-set which way the head's "forward" points (N/E/S/W) without the on-screen calibration. |
+| **Heading** | How the head finds "forward" (true north). **Manual** = pick N/E/S/W or type an exact bearing. **Auto** = read it from the on-board magnetometer. Auto needs a one-time **Calibrate compass** (rotate the device through a full turn); a **Mounting trim** nudges the reading if it's consistently off. The page shows a live heading/quality readout, and if a magnetometer fix is poor (tilted base, magnetic clutter) it **falls back to your manual setting** automatically. |
+| **Declination** | Magnetic → true-north correction for the magnetometer. **Auto** computes it on-device from your location with the embedded **World Magnetic Model 2025** (no network); untick to enter your local declination by hand. |
 | **Observer location** | Shows the **geolocation status** (📍 city + coordinates on success, or a ⚠ failure notice). Override lat/lon, or tap **Auto-locate from IP**. |
 | **Clock offset** | UTC offset (hours) for the displayed clock — auto-detected from your IP, override here. Tracking itself always uses UTC. |
 | **LED bars** | RGB bars **green while tracking**, **red while waiting** for the next pass. On by default; uncheck to turn them off. |
 | **Sleep schedule** | Quiet hours — set a local **Sleep at / Wake at** window. During it the head goes limp (servo torque released), and the screen + LEDs turn off (WiFi stays up). Toggle to enable. |
-| **Actions** | Re-download TLEs, recenter the head, **Recover servos** (re-enable torque after a stall), or **SLEEP NOW** (the button becomes **WAKE NOW** while asleep). |
+| **Actions** | Re-download TLEs, recenter the head, **Recover servos** (re-enable torque after a stall), **Servo ID setup** (reboots into the on-screen bus-servo ID tool — see below), or **SLEEP NOW** (the button becomes **WAKE NOW** while asleep). |
 | **Motor test** | Tick **Test mode** to pause tracking and drive the pan/tilt servos directly (sliders, presets, and **Sweep pan / Sweep tilt**). Bypasses all az/el math, so it isolates each physical motor — if "Sweep pan" moves nothing but "Sweep tilt" works, the azimuth servo isn't responding. |
 
 While asleep the device keeps serving the web page, so you can **WAKE NOW** from
-your phone — or just **tap the (dark) screen** to wake it. A manual wake during a
+your phone — or **tap the (dark) screen 4 times quickly** to wake it. A manual wake during a
 scheduled window holds until the next window edge, when the schedule resumes.
 
 Changes persist to NVS and apply immediately (a group change kicks off a
@@ -191,8 +254,8 @@ The JSON API behind the page (handy for scripting):
 | `/` | GET | The control page |
 | `/status.json` | GET | Live target + telemetry + servo angles + IP + time |
 | `/config.json` | GET | Current saved configuration |
-| `/config` | POST | Apply config (form fields: `group`, `filter`, `minel`, `maxel`, `panlim`, `orbit`, `facing`, `lat`, `lon`, `tzoff`, `leds`, `sleepsched`, `sleepstart`, `sleepend`) |
-| `/action` | POST | `cmd=` `refetch` \| `relocate` \| `park` \| `prev` \| `next` \| `sleep` \| `wake` \| `recover` \| `test` \| `testexit` |
+| `/config` | POST | Apply config (form fields: `group`, `filter`, `minel`, `maxel`, `panlim`, `orbit`, `facing`, `hsrc`, `mhead`, `hoff`, `declauto`, `decl`, `lat`, `lon`, `tzoff`, `leds`, `sleepsched`, `sleepstart`, `sleepend`) |
+| `/action` | POST | `cmd=` `refetch` \| `relocate` \| `park` \| `prev` \| `next` \| `sleep` \| `wake` \| `recover` \| `calmag` \| `applyhead` \| `servosetup` \| `test` \| `testexit` |
 | `/test` | POST | Motor test: `pan` / `tilt` in degrees (only while test mode is active) |
 
 > No authentication — intended for your **local network** only. Don't port-forward it.
@@ -214,6 +277,10 @@ src/
   Provision.*         Captive-portal + on-screen QR + touch-keyboard onboarding
   Sky.*               Loads TLEs, runs SGP4, picks the best reachable target
   ServoHead.*         az/el -> StackChan-BSP head pointing (1/10-degree units)
+  ServoSetup.*        On-screen Feetech bus-servo ID tool (after a servo swap)
+  Compass.*           Tilt-compensated magnetometer heading + mag calibration
+  Wmm.*               Offline World Magnetic Model 2025 (magnetic declination)
+  wmm_coeffs.h        Embedded WMM2025 spherical-harmonic coefficients (NOAA)
   UI.*                Screens: provision, keyboard, calibrate, tracking HUD
   SatIcon.*           Vector satellite icons by type (classified from the name)
   WebControl.*        HTTP server: live telemetry + satellite config API
@@ -253,6 +320,13 @@ at infinity, so aiming the display normal along the (az, el) vector is exactly
   from git, so PlatformIO needs `git` available.
 - **Head pans or tilts the wrong way** — flip `YAW_DIR` / `PITCH_DIR` in
   [`src/config.h`](src/config.h) (see [Calibration](#️-calibration--do-this-first)).
+- **An axis reads "NO RESPONSE" / doesn't move (often after a servo swap)** — the
+  replacement servo's **bus ID** is wrong. Set it with **Actions → Servo ID setup**
+  (pan = 1, tilt = 2) — see [Replacing a servo](#replacing-a-servo-bus-ids).
+- **Always "no upcoming passes" / "out of reach", never a countdown** — the tracker
+  only counts down to passes it can *point at*. Widen the **pan ±°** and **min/max
+  elevation** reach limits and confirm the **facing/heading**; passes that fall
+  inside the arc will then count down and get tracked.
 - **Camera shares the CoreS3 internal I²C bus with the touch panel.** This
   firmware uses touch (not the camera), so it's fine — but if you later add the
   GC0308 camera (e.g. for auto-heading or QR scanning), it contends with the

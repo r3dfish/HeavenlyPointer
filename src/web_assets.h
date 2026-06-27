@@ -5,10 +5,14 @@
 #pragma once
 #include <Arduino.h>
 
+// Tiny SVG favicon (a satellite): served at /favicon.svg and referenced in <head>.
+static const char FAVICON_SVG[] PROGMEM = R"SVG(<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='#0f1419'/><line x1='8' y1='8' x2='24' y2='24' stroke='#39d7f2' stroke-width='2.5'/><rect x='3' y='3' width='8' height='8' rx='1.5' transform='rotate(45 7 7)' fill='#7fe9ff'/><rect x='21' y='21' width='8' height='8' rx='1.5' transform='rotate(45 25 25)' fill='#7fe9ff'/><rect x='11.5' y='11.5' width='9' height='9' rx='2' transform='rotate(45 16 16)' fill='#39d7f2'/></svg>)SVG";
+
 static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 <html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>HeavenlyPointer</title>
+<link rel=icon type=image/svg+xml href=/favicon.svg>
 <style>
 :root{--bg:#0c1016;--card:#161c26;--mut:#7b8aa0;--acc:#37c7e6;--ok:#3ad07a;--warn:#ff6b6b}
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:#eef2f7}
@@ -93,10 +97,36 @@ small{color:var(--mut)}
     <input id=tzoff type=number step=0.25 placeholder="auto-detected from IP">
     <small>e.g. -5 (US Eastern), +1 (CET), +5.5 (India). Auto-locate refills this.</small>
 
-    <label>Facing — which way the head points "forward"</label>
-    <select id=facing>
-      <option>NORTH</option><option>EAST</option><option>SOUTH</option><option>WEST</option>
+    <label>Heading — how the head finds "forward" (true north)</label>
+    <select id=hsrc onchange=hsrcChange()>
+      <option value=0>Manual (I set it)</option>
+      <option value=1>Auto (magnetometer)</option>
     </select>
+    <div id=manualhead>
+      <div class=row style=margin-top:6px>
+        <div><label>Facing</label>
+          <select id=facing><option>NORTH</option><option>EAST</option><option>SOUTH</option><option>WEST</option></select>
+        </div>
+        <div><label>or exact bearing °</label><input id=mhead type=number min=0 max=359 step=1 placeholder="blank = use N/E/S/W"></div>
+      </div>
+    </div>
+    <div id=autohead style=display:none>
+      <div id=headstat style="font-size:13px;margin:6px 0;color:var(--mut)">—</div>
+      <div class=btns>
+        <button class=sec onclick="act('calmag')">Calibrate compass</button>
+        <button class=sec onclick="act('applyhead')">Re-read heading</button>
+      </div>
+      <div class=row style=margin-top:6px>
+        <div><label>Mounting trim °</label><input id=hoff type=number min=-180 max=180 step=1></div>
+      </div>
+      <small>Calibrate from the device: rotate it through a full turn. Reads with servos relaxed + LEDs off. If it's unreliable on a metal desk, switch to Manual.</small>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;color:#eef2f7;margin-top:10px">
+      <input type=checkbox id=declauto style="width:auto" onchange=declChange()> Auto declination (WMM) — magnetic → true north
+    </label>
+    <div class=row style=margin-top:4px>
+      <div><label>Declination °E</label><input id=decl type=number step=0.1></div>
+    </div>
 
     <label>Observer location (decimal degrees)</label>
     <div id=geostat style="font-size:13px;margin:2px 0 6px;color:var(--mut)">—</div>
@@ -128,7 +158,9 @@ small{color:var(--mut)}
       <button class=sec onclick=act('refetch')>Re-download TLEs</button>
       <button class=sec onclick=act('park')>Recenter head</button>
       <button class=sec onclick=act('recover')>Recover servos</button>
+      <button class=sec onclick="if(confirm('Reboot into the on-screen Servo ID tool? Plug in ONLY the servo whose ID you want to change (pan=1, tilt=2).'))act('servosetup')">Servo ID setup</button>
     </div>
+    <small>After replacing a servo, use <b>Servo ID setup</b> to set its bus ID (pan = 1, tilt = 2), and <b>Set center</b> there to re-zero "forward/level".</small>
     <button id=sleepbtn onclick=toggleSleep() style=margin-top:10px>SLEEP NOW</button>
   </div>
 
@@ -185,12 +217,20 @@ async function refresh(){
       $('name').textContent='😴 Sleeping'; $('name').className='big';
       $('visdot').style.background='#446'; $('vistext').textContent='press WAKE NOW to resume';
       ['az','el','rng','alt','vel','sub','servo'].forEach(k=>$(k).textContent='—');
+    }else if(s.lowBattery){
+      $('name').textContent='🔋 Low battery'; $('name').className='big';
+      $('visdot').style.background='#864'; $('vistext').textContent='servos relaxed — plug in to track';
+      ['az','el','rng','alt','vel','sub','servo'].forEach(k=>$(k).textContent='—');
+    }else if(s.stalled){
+      $('name').textContent='⚠ Servo stall'; $('name').className='big';
+      $('visdot').style.background='#864'; $('vistext').textContent='servos relaxed — check calibration';
+      ['az','el','rng','alt','vel','sub','servo'].forEach(k=>$(k).textContent='—');
     }else if(s.tracking){
       $('name').textContent=s.name; $('name').className='big acc';
       $('az').textContent=f1(s.az)+'°'; $('el').textContent=f1(s.el)+'°';
       $('rng').textContent=Math.round(s.rangeKm*KM2MI)+' mi';
       $('alt').textContent=Math.round(s.altKm*KM2MI)+' mi';
-      $('vel').textContent=f1(s.velKms,2)+' km/s';
+      $('vel').textContent=Math.round(s.velKms*3600*KM2MI)+' mph';
       $('sub').textContent=f1(s.subLat,1)+', '+f1(s.subLon,1);
       $('servo').textContent=Math.round(s.pan)+'° / '+Math.round(s.tilt)+'°'+(s.inRange?'':' ⚠');
       $('visdot').style.background=s.vis>0?'var(--ok)':(s.vis==0?'#446':'#864');
@@ -200,17 +240,30 @@ async function refresh(){
         const t=s.nextInSec, hh=Math.floor(t/3600), mm=Math.floor(t/60)%60, ss=t%60, p=n=>String(n).padStart(2,'0');
         $('name').textContent='⏱ '+(hh>0?`${hh}:${p(mm)}:${p(ss)}`:`${mm}:${p(ss)}`);
         $('name').className='big acc'; $('vistext').textContent='next: '+s.nextName;
+      }else if(s.nextInReach===false && s.nextName){
+        $('name').textContent='Out of reach'; $('name').className='big';
+        $('vistext').textContent=s.nextName+' — widen limits / check facing';
       }else{
         $('name').textContent='Scanning the sky…'; $('name').className='big';
         $('vistext').textContent='waiting for a pass';
       }
       ['az','el','rng','alt','vel','sub','servo'].forEach(k=>$(k).textContent='—');
-      $('visdot').style.background='#446';
+      $('visdot').style.background= (!s.hasNext && s.nextInReach===false && s.nextName) ? '#864' : '#446';
     }
     $('sats').textContent=s.satCount;
-    $('foot').textContent= s.testMode ? ('motor test · '+s.ip)
+    const hd=$('headstat');
+    if(hd){
+      if(!s.magPresent){ hd.style.color='var(--warn)'; hd.textContent='⚠ no magnetometer detected — use Manual'; }
+      else if(s.headSource===1 && s.headAuto){ hd.style.color='var(--ok)';
+        hd.textContent='🧭 forward '+f1(s.headTrue,0)+'° true (mag '+f1(s.headMag,0)+'° + decl '+f1(s.declination,1)+'°) · tilt '+f1(s.headTilt,0)+'° · quality '+f1(s.headQual,0)+'%'; }
+      else if(s.headSource===1){ hd.style.color='var(--warn)';
+        hd.textContent='⚠ magnetometer fix poor (quality '+f1(s.headQual,0)+'%, tilt '+f1(s.headTilt,0)+'°) — holding manual. Recalibrate or trim.'; }
+      else { hd.style.color='var(--mut)'; hd.textContent='forward '+f1(s.headTrue,0)+'° true'; }
+    }
+    const batt = (s.battLevel>=0) ? ('  ·  '+(s.charging?'⚡':'🔋')+s.battLevel+'%') : '';
+    $('foot').textContent= (s.testMode ? ('motor test · '+s.ip)
       : s.sleeping ? ('asleep · '+s.iso+' · '+s.ip)
-      : ('group: '+s.group+'  ·  '+s.iso+'  ·  '+s.ip+'  ·  TLEs '+s.tleAgeMin+' min old');
+      : ('group: '+s.group+'  ·  '+s.iso+'  ·  '+s.ip+'  ·  TLEs '+s.tleAgeMin+' min old')) + batt;
   }catch(e){ $('foot').textContent='disconnected'; }
 }
 function toggleSleep(){ act($('sleepbtn').textContent.trim()==='SLEEP NOW'?'sleep':'wake'); }
@@ -225,16 +278,25 @@ async function loadCfg(){
   $('group').value=c.group; $('filter').value=c.filter||'';
   $('minel').value=c.minElevation; $('maxel').value=c.maxElevation; $('panlim').value=c.panLimit;
   $('facing').value=c.facing;
+  $('hsrc').value=c.headingSource; $('hoff').value=c.headingOffset;
+  $('mhead').value=(c.manualHeading>=0)?Math.round(c.manualHeading):'';
+  $('declauto').checked=!c.declinationManual; $('decl').value=Number(c.declination).toFixed(1);
+  if(!c.magPresent){ $('hsrc').querySelector('option[value="1"]').textContent='Auto (no magnetometer)'; }
+  hsrcChange(); declChange();
   $('tzoff').value=c.tzOffsetHours; $('orbit').value=c.orbitClass; $('leds').checked=c.ledBars;
   $('sleepsched').checked=c.sleepSchedule; $('sleepstart').value=c.sleepStart; $('sleepend').value=c.sleepEnd;
   if(c.hasLocation){ $('lat').value=c.lat; $('lon').value=c.lon; }
   $('ver').textContent=c.version||'';
 }
+function hsrcChange(){ const auto=$('hsrc').value==='1';
+  $('autohead').style.display=auto?'block':'none'; $('manualhead').style.display=auto?'none':'block'; }
+function declChange(){ $('decl').disabled=$('declauto').checked; }
 async function saveCfg(){
   const b=new URLSearchParams();
-  ['group','filter','minel','maxel','panlim','facing','lat','lon','tzoff','orbit','sleepstart','sleepend'].forEach(k=>b.append(k,$(k).value));
+  ['group','filter','minel','maxel','panlim','facing','lat','lon','tzoff','orbit','sleepstart','sleepend','hsrc','mhead','hoff','decl'].forEach(k=>b.append(k,$(k).value));
   b.append('leds', $('leds').checked?'1':'0');
   b.append('sleepsched', $('sleepsched').checked?'1':'0');
+  b.append('declauto', $('declauto').checked?'1':'0');
   await fetch('/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
   setTimeout(()=>{loadCfg();refresh();},400);
 }

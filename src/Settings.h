@@ -24,6 +24,14 @@ struct Settings {
     Facing   facing = FACE_NORTH;
     bool     hasFacing = false;
 
+    // --- Heading / compass ---
+    uint8_t  headingSource    = HEADING_MANUAL; // see HeadingSource (manual vs magnetometer)
+    float    manualHeadingDeg = -1.0f;          // manual TRUE bearing the face points; <0 = derive from facing
+    float    headingOffsetDeg = 0.0f;           // mounting trim added to the raw magnetometer heading
+    float    declinationDeg   = 0.0f;           // magnetic declination (deg E); auto from WMM unless declinationManual
+    bool     declinationManual = false;         // true = use declinationDeg as typed, don't auto-compute
+    bool     magCalDone        = false;         // magnetometer has been calibrated at least once
+
     // --- Catalog ---
     String   tleGroup = DEFAULT_TLE_GROUP;
     uint32_t tleFetchedAt = 0;   // unix UTC when catalog was last downloaded

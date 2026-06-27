@@ -20,6 +20,9 @@
 #include "Provision.h"
 #include "Sky.h"
 #include "ServoHead.h"
+#include "ServoSetup.h"
+#include "Compass.h"
+#include "Wmm.h"
 #include "UI.h"
 #include "Status.h"
 #include "WebControl.h"
@@ -33,8 +36,14 @@ bool       g_tleRefetchNeeded = false;
 bool       g_relocateNeeded   = false;
 bool       g_sleepNow         = false;
 bool       g_testMode         = false;
+uint32_t   g_lastTestCmdMs    = 0;
+bool       g_lowBattery       = false;
+bool       g_stalled          = false;
+bool       g_calibrateMagNeeded = false;
+bool       g_applyHeadingNeeded = false;
 int        g_geoStatus        = GEO_NONE;
 String     g_geoCity;
+HeadingState g_heading;
 
 static int  s_lastLed = -1;    // last RGB-bar state pushed (-1 = force refresh)
 static bool s_forceRedraw = false;   // request an immediate HUD redraw (e.g. on wake)
@@ -49,6 +58,88 @@ static uint32_t tleAgeSeconds(time_t now) {
     if (now == 0 || settings.tleFetchedAt == 0) return UINT32_MAX;
     if (now < (time_t)settings.tleFetchedAt)     return UINT32_MAX;
     return (uint32_t)(now - settings.tleFetchedAt);
+}
+
+// Recompute & cache magnetic declination for the current location/date, unless
+// the user pinned it by hand. Offline (embedded WMM2025). Cheap.
+static void refreshDeclination(time_t now) {
+    if (settings.declinationManual || !settings.hasLocation) return;
+    settings.declinationDeg =
+        Wmm::declination((float)settings.lat, (float)settings.lon, 0.0f, Wmm::decimalYear(now));
+}
+
+// Set the head's forward bearing from the current heading settings. In AUTO
+// mode this reads the magnetometer with the servos relaxed and the LEDs off
+// (both sit next to the sensor), adds the WMM declination, and falls back to
+// manual if the magnetometer read is poor. Updates g_heading for the web page.
+static void applyForwardBearing() {
+    g_heading.magPresent  = Compass::available();
+    g_heading.declination = settings.declinationDeg;
+
+    bool used = false;
+    if (settings.headingSource == HEADING_AUTO && settings.magCalDone && Compass::available()) {
+        ServoHead::relax();                  // silence the pan servo
+        M5StackChan.showRgbColor(0, 0, 0);   // and the LEDs, both next to the sensor
+        delay(120);
+        float mh = 0, tilt = 0, q = 0;
+        if (Compass::readHeading(&mh, &tilt, &q) && q >= 40.0f) {
+            ServoHead::setForwardBearing(mh + settings.declinationDeg);  // magnetic -> true
+            g_heading.autoActive  = true;
+            g_heading.magHeading  = mh;
+            g_heading.tilt        = tilt;
+            g_heading.quality     = q;
+            used = true;
+        } else {
+            g_heading.tilt = tilt; g_heading.quality = q;   // record why we fell back
+        }
+        s_lastLed = -1; s_forceRedraw = true;   // restore LEDs/HUD next tick
+    }
+    if (!used) {
+        g_heading.autoActive = false;
+        float b = (settings.manualHeadingDeg >= 0.0f) ? settings.manualHeadingDeg
+                                                       : facingBearing(settings.facing);
+        ServoHead::setForwardBearing(b);
+    }
+    g_heading.forwardTrue = ServoHead::forwardBearing();
+}
+
+// Interactive magnetometer calibration: relax the head, cut the LEDs, and ask
+// the user to slowly rotate the device through a full turn while M5Unified's
+// sphere fit accumulates. Persists offsets to NVS and re-applies the heading.
+static void runCompassCalibration() {
+    if (!Compass::available()) { UI::status("No magnetometer", TFT_RED); delay(1200); return; }
+    ServoHead::relax();
+    M5StackChan.showRgbColor(0, 0, 0);
+    s_lastLed = -1;
+    Compass::startCalibration();
+    uint32_t start = millis();
+    for (;;) {
+        M5.update();
+        WebControl::handle();                  // keep the browser responsive
+        Compass::updateCalibration();
+        float p = Compass::calProgress();
+        UI::drawCompassCal(p);
+        uint32_t el = millis() - start;
+        if (M5.Touch.getCount()) { auto d = M5.Touch.getDetail(); if (d.wasPressed() && el > 2000) break; }
+        if ((p >= (float)COMPASS_CAL_SECTORS / 12.0f && el > 6000) || el > 30000) break;
+        delay(15);
+    }
+    // Only commit if the figure-8 actually covered enough of the sky. Otherwise
+    // DON'T persist the half-baked sphere-fit (it would mispoint every pass) -
+    // discard it, restore the prior offsets, and leave magCalDone untouched.
+    bool ok = Compass::calProgress() >= (float)COMPASS_CAL_SECTORS / 12.0f;
+    if (ok) {
+        Compass::finishCalibration();
+        settings.magCalDone = true;
+        settings.save();
+        UI::status("Compass calibrated", TFT_GREEN);
+    } else {
+        Compass::cancelCalibration();
+        UI::status("Calibration incomplete", TFT_RED, "sweep further & retry");
+    }
+    delay(1200);
+    applyForwardBearing();
+    s_forceRedraw = true;
 }
 
 // Sync time + location, (re)download TLEs if missing/stale, load the catalog.
@@ -95,8 +186,48 @@ static void doFetch() {
                loaded > 0 ? TFT_GREEN : TFT_RED);
     delay(1000);
 
+    // Now that location + date are known, refresh declination and point the
+    // head's "forward" using the chosen heading source.
+    refreshDeclination(now);
+    settings.save();
+    applyForwardBearing();
+
     // WiFi is up here - bring up the browser control server.
     WebControl::begin();
+}
+
+// Can we track right now WITHOUT WiFi? Needs a cached TLE catalog, a known
+// location, and a valid clock (restored from the battery-backed RTC on boot).
+static bool offlineCapable() {
+    return LittleFS.exists(TLE_FILE_PATH) && settings.hasLocation && Net::nowUtc() > 0;
+}
+
+// Offline start: use the cached TLEs + saved location + RTC clock, no WiFi.
+// Returns false if there's nothing usable on disk (caller falls back online).
+static bool doFetchOffline() {
+    if (!LittleFS.exists(TLE_FILE_PATH)) return false;
+    UI::status("Offline mode", TFT_CYAN, "using cached data");
+    Sky::setSite(settings.lat, settings.lon, settings.altM);
+    Sky::setMinElevation(settings.minElevation);
+    Sky::setFilter(settings.filter);
+    Sky::setOrbitClass(settings.orbitClass);
+    ServoHead::setLimits(settings.panLimit, settings.minElevation, settings.maxElevation);
+    int loaded = Sky::load();
+    if (loaded == 0) {
+        // File exists but is empty/corrupt: quarantine it so offlineCapable() stops
+        // offering Offline mode (otherwise the button would just bounce us back here).
+        LittleFS.remove(TLE_FILE_PATH);
+        UI::status("Cached data unusable", TFT_RED, "connect to refresh");
+        delay(1500);
+        return false;
+    }
+    time_t now = Net::nowUtc();
+    refreshDeclination(now);
+    applyForwardBearing();
+    UI::status((String(loaded) + " sats (offline)").c_str(), TFT_GREEN);
+    delay(1200);
+    return true;
+    // No web server offline - there's no shared network to reach it on.
 }
 
 // Re-download the TLE catalog for the current group, then reload + re-apply
@@ -115,6 +246,10 @@ static void refetchCatalog(time_t now) {
 // One tracking iteration (called continuously while in ST_TRACK).
 static void trackTick() {
     static uint32_t lastTrack = 0, lastServo = 0, lastFetchAttempt = 0, nextPassMs = 0;
+    static uint32_t lastPowerCheck = 0, s_stallSince = 0, s_cooldownStart = 0;
+    static bool     s_stallCooldown = false;
+    static float    s_prevActP = 0, s_prevActT = 0;
+    static int      s_warnScreen = 0;            // 0 none, 1 low-batt, 2 stall (draw-once dedup)
     static Sky::NextPass nextPass;
 
     if (g_testMode) {                        // manual motor test - tracking paused
@@ -124,6 +259,13 @@ static void trackTick() {
             lastTestDraw = tms;
             UI::drawTest(ServoHead::panAngle(), ServoHead::tiltAngle(),
                          ServoHead::readPan(), ServoHead::readTilt());
+        }
+        // Guard A: if you leave test mode holding a pose and walk away, cut the
+        // torque after a while so a servo isn't held against gravity forever.
+        static uint32_t lastSeenCmd = 0; static bool testRelaxed = false;
+        if (g_lastTestCmdMs != lastSeenCmd) { lastSeenCmd = g_lastTestCmdMs; testRelaxed = false; }
+        if (!testRelaxed && tms - g_lastTestCmdMs > TEST_IDLE_RELAX_MS) {
+            ServoHead::relax(); testRelaxed = true;
         }
         g_status.tracking = false;
         s_idleSince = 0;                     // on test exit, re-run the park->relax cycle
@@ -180,7 +322,40 @@ static void trackTick() {
         g_status.satCount = Sky::count();
         g_status.utc      = now;
 
-        if (t.valid) {                         // valid => reachable (within az/el limits)
+        // Guard C: don't hold the servos against gravity on a draining battery
+        // (the condition that amplified the original burnout). Checked ~10s.
+        if (ms - lastPowerCheck > 10000) {
+            lastPowerCheck = ms;
+            int  lvl = M5.Power.getBatteryLevel();
+            bool charging    = (M5.Power.isCharging() == m5::Power_Class::is_charging);
+            bool discharging = (M5.Power.isCharging() == m5::Power_Class::is_discharging);
+            // Latched with hysteresis: trip below the floor while discharging, and
+            // only clear once plugged in AND back above floor+8%. Without the latch,
+            // relaxing the head unloads the cell, % springs back over the floor, and
+            // the guard re-energizes the servo it just protected -> oscillation.
+            if (!g_lowBattery) {
+                if (discharging && lvl >= 0 && lvl < LOW_BATT_PCT) g_lowBattery = true;
+            } else if (charging && lvl >= LOW_BATT_PCT + 8) {
+                g_lowBattery = false;
+            }
+        }
+
+        if (g_lowBattery) {                    // battery low + unplugged -> go limp
+            ServoHead::relax();
+            g_status.tracking = false; g_status.name[0] = 0; g_status.hasNext = false;
+            g_stalled = false;
+            s_idleSince = 0;
+            if (s_warnScreen != 1) { UI::status("Low battery", TFT_RED, "plug in to track"); s_warnScreen = 1; }
+        } else if (t.valid && s_stallCooldown &&
+                   (uint32_t)(ms - s_cooldownStart) < STALL_COOLDOWN_MS) {
+            // Stall cooldown: a recent aim couldn't reach target (likely a jam) -
+            // stay limp instead of grinding into the stop.
+            ServoHead::relax();
+            g_status.tracking = false;
+            if (s_warnScreen != 2) { UI::status("Servo stall", TFT_RED, "check calibration"); s_warnScreen = 2; }
+        } else if (t.valid) {                   // valid => reachable (within az/el limits)
+            s_warnScreen = 0;
+            s_stallCooldown = false;            // cooldown elapsed / inactive -> resume tracking
             ServoHead::aimAt((float)t.az, (float)t.el);
             s_idleSince       = 0;             // left idle: re-home/relax on next gap
             g_status.tracking = true;
@@ -193,7 +368,32 @@ static void trackTick() {
             g_status.subLat = t.subLat; g_status.subLon = t.subLon; g_status.vis = t.vis;
             UI::drawTracking(t, ServoHead::panAngle(), ServoHead::tiltAngle(),
                              ServoHead::inRange(), now, g_status.satCount);
+
+            // Guard B: if the head can't reach the commanded angle AND isn't
+            // moving, it's jammed/stalled - cut torque before stall current
+            // cooks the servo, then cool down before retrying.
+            float actP = ServoHead::readPan(), actT = ServoHead::readTilt();
+            // Per-axis: pair each axis's OWN gap with its OWN motion. A jammed tilt
+            // fighting gravity must trip even while pan slews across the pass - a
+            // shared OR-gap / AND-stuck let a moving pan mask a stalled tilt, the
+            // exact burnout case this guard exists to catch.
+            bool panStall  = fabsf(ServoHead::panAngle()  - actP) > STALL_GAP_DEG &&
+                             fabsf(actP - s_prevActP) < STALL_MOVE_DEG;
+            bool tiltStall = fabsf(ServoHead::tiltAngle() - actT) > STALL_GAP_DEG &&
+                             fabsf(actT - s_prevActT) < STALL_MOVE_DEG;
+            s_prevActP = actP; s_prevActT = actT;
+            if (panStall || tiltStall) {
+                if (s_stallSince == 0) s_stallSince = ms;
+                else if (ms - s_stallSince > STALL_HOLD_MS) {
+                    ServoHead::relax();
+                    s_stallCooldown = true; s_cooldownStart = ms;  // rollover-safe elapsed test
+                    s_stallSince = 0;
+                    g_stalled = true;
+                }
+            } else { s_stallSince = 0; g_stalled = false; }
         } else {
+            s_warnScreen = 0;
+            g_stalled = false;                 // not tracking -> clear any stale stall flag
             // Idle: home the head ONCE, then de-energize the servos. Re-issuing
             // park() every second kept the tilt motor holding the head up
             // against gravity continuously - on a sagging battery that constant
@@ -202,17 +402,23 @@ static void trackTick() {
             else if (!s_idleRelaxed && ms - s_idleSince > 2500) { ServoHead::relax(); s_idleRelaxed = true; }
             g_status.tracking = false;
             g_status.name[0] = 0;
-            // Predict the next pass occasionally; just count down in between.
-            if (!nextPass.valid || now >= nextPass.aosUnix || ms - nextPassMs > 60000UL) {
+            // computeNextPass is heavy (SGP4 over the whole catalog), so THROTTLE it:
+            // first run, when the reachable AOS arrives, or every 60 s. Never every
+            // tick - even when nothing is reachable (that's what pegged the loop).
+            bool aosArrived = nextPass.valid && now >= nextPass.aosUnix;
+            if (nextPassMs == 0 ||
+                (aosArrived && ms - nextPassMs > 5000UL) ||   // min 5 s apart: can't peg the loop
+                ms - nextPassMs > 60000UL) {
                 nextPass = Sky::computeNextPass(now);
                 nextPassMs = ms;
             }
-            g_status.hasNext = nextPass.valid;
-            if (nextPass.valid) {
-                strncpy(g_status.nextName, nextPass.name, sizeof(g_status.nextName) - 1);
-                g_status.nextName[sizeof(g_status.nextName) - 1] = 0;
-                g_status.nextAos = nextPass.aosUnix;
-            }
+            // hasNext = a REACHABLE pass to count down to. nextName/nextInReach are
+            // set regardless so the empty state can say "out of reach" vs "no passes".
+            g_status.hasNext     = nextPass.valid;
+            g_status.nextInReach = nextPass.inReach;
+            strncpy(g_status.nextName, nextPass.name, sizeof(g_status.nextName) - 1);
+            g_status.nextName[sizeof(g_status.nextName) - 1] = 0;
+            if (nextPass.valid) g_status.nextAos = nextPass.aosUnix;
             UI::drawSearching(now, g_status.satCount, nextPass);
         }
         // Servo readout reflects the command just issued (aim or park).
@@ -284,6 +490,10 @@ void setup() {
     UI::begin();
     UI::splash("Heavenly", "Pointer", "satellite tracker");
 
+    // One-time servo ID tool (requested from the web). Borrows the bus and
+    // reboots when done; never returns. Runs here so the servo rail is powered.
+    if (ServoSetup::pending()) ServoSetup::run();
+
     if (!LittleFS.begin(true)) {           // format on first boot if needed
         UI::status("Filesystem error", TFT_RED);
         delay(2000);
@@ -291,11 +501,23 @@ void setup() {
 
     settings.load();
     ServoHead::begin();                    // parks the head
-    if (settings.hasFacing) ServoHead::setFacing(settings.facing);
+    Compass::begin();                      // magnetometer (loads stored offsets)
+    applyForwardBearing();                 // forward bearing from manual/auto heading (cached declination)
     ServoHead::setLimits(settings.panLimit, settings.minElevation, settings.maxElevation);
 
     delay(700);
     state = settings.hasWifi() ? ST_CONNECT : ST_PROVISION;
+}
+
+// 4 rapid taps in a row -> true (then resets). Drives the standby/wake gesture.
+static bool quadTap() {
+    static uint32_t lastMs = 0;
+    static int streak = 0;
+    uint32_t now = millis();
+    streak = (now - lastMs <= QUAD_TAP_GAP_MS) ? streak + 1 : 1;
+    lastMs = now;
+    if (streak >= 4) { streak = 0; return true; }
+    return false;
 }
 
 void loop() {
@@ -311,25 +533,45 @@ void loop() {
         ESP.restart();
     }
 
+    // Magnetometer calibration / heading re-apply requested from the web UI.
+    if (g_calibrateMagNeeded && state == ST_TRACK && !g_testMode && !g_sleepNow) {
+        g_calibrateMagNeeded = false;
+        runCompassCalibration();
+    }
+    if (g_applyHeadingNeeded && state == ST_TRACK && !g_testMode) {
+        g_applyHeadingNeeded = false;
+        refreshDeclination(Net::nowUtc());
+        applyForwardBearing();
+        s_forceRedraw = true;
+    }
+
     // Schedule drives auto-sleep at the window edges (not while motor-testing).
     if (!g_testMode && (state == ST_TRACK || state == ST_SLEEP)) updateSleepSchedule(Net::nowUtc());
 
-    // Touch: browse prev/next while tracking; any tap wakes from sleep.
-    if (state == ST_TRACK && !g_testMode && M5.Touch.getCount()) {
+    // Touch: top-corner taps browse prev/next while tracking; a quadruple-tap
+    // anywhere else toggles standby (and a quadruple-tap wakes it back up).
+    if ((state == ST_TRACK || state == ST_SLEEP) && !g_testMode && M5.Touch.getCount()) {
         auto d = M5.Touch.getDetail();
-        if (d.wasPressed() && d.y < 44) {
-            if (d.x < 70)       Sky::selectPrev();
-            else if (d.x > 250) Sky::selectNext();
+        if (d.wasPressed()) {
+            bool browsed = false;
+            if (state == ST_TRACK && d.y < 44) {
+                if (d.x < 70)       { Sky::selectPrev(); browsed = true; }
+                else if (d.x > 250) { Sky::selectNext(); browsed = true; }
+            }
+            if (!browsed && quadTap()) g_sleepNow = !g_sleepNow;   // 4 taps: sleep <-> wake
         }
-    } else if (state == ST_SLEEP && M5.Touch.getCount()) {
-        auto d = M5.Touch.getDetail();
-        if (d.wasPressed()) g_sleepNow = false;     // tap the dark screen to wake
     }
 
     switch (state) {
         case ST_PROVISION:
-            Provision::run();              // blocks until creds saved
-            state = ST_CONNECT;
+            // Show the "Offline mode" option only when we can actually run on
+            // cached data. run() returns true if the user chose offline.
+            if (Provision::run(offlineCapable())) {
+                if (doFetchOffline()) state = settings.hasFacing ? ST_TRACK : ST_CALIBRATE;
+                else                  state = ST_CONNECT;     // nothing cached -> need WiFi
+            } else {
+                state = ST_CONNECT;
+            }
             break;
 
         case ST_CONNECT:
@@ -337,9 +579,10 @@ void loop() {
             if (Net::connect(settings.ssid, settings.pass)) {
                 state = ST_FETCH;
             } else {
-                UI::status("WiFi failed - re-setup", TFT_RED);
+                // KEEP the saved creds (so it reconnects back home) - just fall
+                // back to setup, where Offline mode is offered if data is cached.
+                UI::status("WiFi unavailable", TFT_RED, "choose setup or offline");
                 delay(1500);
-                settings.clearWifi();
                 state = ST_PROVISION;
             }
             break;

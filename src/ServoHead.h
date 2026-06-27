@@ -11,6 +11,14 @@ namespace ServoHead {
     // Which compass direction the face points when pan is centered.
     void setFacing(Facing f);
 
+    // Exact forward azimuth (degrees true north) the face points when pan is
+    // centered. Used by the magnetometer auto-heading path and precise manual
+    // entry; setFacing() is just the N/E/S/W shorthand for this.
+    void setForwardBearing(float trueBearingDeg);
+
+    // The current forward bearing (degrees true north).
+    float forwardBearing();
+
     // Runtime reach limits: azimuth +/- panLimitDeg from forward, elevation
     // between elMinDeg and elMaxDeg.
     void setLimits(float panLimitDeg, float elMinDeg, float elMaxDeg);

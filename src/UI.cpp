@@ -82,10 +82,21 @@ void status(const char* msg, uint16_t color, const char* line2) {
 // ---------------------------------------------------------------------------
 //  Provisioning screen (QR + button)
 // ---------------------------------------------------------------------------
-bool drawProvision(const char* joinQr, const char* portalUrl, const char* apSsid) {
+// Force-repaint latch for the provisioning screen. Provision::run() calls
+// resetProvisionCache() on (re)entry, so a stale `painted` static from a prior
+// session can't leave the QR + buttons UNpainted (with live hit-boxes) sitting
+// on top of the "Scanning WiFi..." status screen on a second provisioning.
+static bool s_provRepaint = true;
+void resetProvisionCache() { s_provRepaint = true; }
+
+int drawProvision(const char* joinQr, const char* portalUrl, const char* apSsid, bool showOffline) {
     static bool painted = false;
     static String lastQr;
-    if (!painted || lastQr != joinQr) {
+    static bool lastShowOffline = false;
+    // Repaint on (re)entry, a QR change, OR a change in whether the Offline button
+    // is shown - the hit-boxes below depend on showOffline, so a stale paint would
+    // mismatch the drawn buttons.
+    if (!painted || lastQr != joinQr || lastShowOffline != showOffline || s_provRepaint) {
         M5.Display.fillScreen(TFT_BLACK);
         // The setup network name, prominent across the top.
         M5.Display.setTextDatum(top_center);
@@ -108,23 +119,39 @@ bool drawProvision(const char* joinQr, const char* portalUrl, const char* apSsid
         M5.Display.drawString("from the list.", 148, 116);
         M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
         M5.Display.drawString(portalUrl, 148, 134);
-        button(148, 182, 164, 48, "Touch entry", TFT_NAVY);
+        if (showOffline) {
+            button(148, 150, 164, 38, "Touch entry",  TFT_NAVY);
+            button(148, 194, 164, 38, "Offline mode", TFT_DARKGREEN);
+        } else {
+            button(148, 182, 164, 48, "Touch entry", TFT_NAVY);
+        }
         painted = true;
         lastQr = joinQr;
+        lastShowOffline = showOffline;
+        s_provRepaint = false;
     }
     int x, y;
-    if (getTap(x, y) && hit(x, y, 148, 182, 164, 48)) { painted = false; return true; }
-    return false;
+    if (getTap(x, y)) {
+        if (showOffline) {
+            if (hit(x, y, 148, 150, 164, 38)) { painted = false; return 1; }  // touch entry
+            if (hit(x, y, 148, 194, 164, 38)) { painted = false; return 2; }  // offline
+        } else if (hit(x, y, 148, 182, 164, 48)) { painted = false; return 1; }
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
 //  WiFi network picker (scan + tap)
 // ---------------------------------------------------------------------------
 bool pickSSID(String& out) {
+    bool forceScan = false;
     while (true) {
-        status("Scanning WiFi...", TFT_YELLOW);
-        int n = WiFi.scanNetworks();
+        // Reuse the boot-time site survey if it's still cached; only run a fresh
+        // scan on first entry without one, or when the user taps Rescan.
+        int n = forceScan ? -1 : WiFi.scanComplete();
+        if (n < 0) { status("Scanning WiFi...", TFT_YELLOW); n = WiFi.scanNetworks(); }
         if (n < 0) n = 0;
+        forceScan = false;
 
         M5.Display.fillScreen(TFT_BLACK);
         M5.Display.setTextDatum(top_left);
@@ -157,8 +184,8 @@ bool pickSSID(String& out) {
             if (hit(x, y, 6, ry, 308, 24)) { out = WiFi.SSID(i); WiFi.scanDelete(); return true; }
         }
         if (hit(x, y, 6, 206, 150, 30))   { out = ""; WiFi.scanDelete(); return true; } // manual
-        // else "Rescan" -> loop again
-        WiFi.scanDelete();
+        if (hit(x, y, 164, 206, 150, 30)) forceScan = true;   // Rescan -> fresh scan next loop
+        // a stray tap just redraws the (cached) list - no needless rescan
     }
 }
 
@@ -176,22 +203,44 @@ static const char* const* kbRows(int mode) {
     return mode == 1 ? KB_UPP : (mode == 2 ? KB_SYM : KB_LOW);
 }
 
-static void drawKeyboard(const char* title, const String& buf, bool password, int mode) {
+// Right-of-field buttons: show/hide (eye, on password fields) and Back (when
+// cancellable). Positions depend on which are present so draw + hit-test agree.
+static const int KB_BTN_Y = 18, KB_BTN_W = 58, KB_BTN_H = 30;
+static int kbFieldW(bool eye, bool back) { return 308 - ((eye?1:0)+(back?1:0)) * (KB_BTN_W + 6); }
+static int kbEyeX (bool eye, bool back)  { return eye ? (6 + kbFieldW(eye, back) + 6) : -1; }
+static int kbBackX(bool eye, bool back)  { if (!back) return -1; int x = 6 + kbFieldW(eye, back) + 6; if (eye) x += KB_BTN_W + 6; return x; }
+
+static void drawKeyboard(const char* title, const String& buf, bool password, bool reveal,
+                         int mode, const char* rightLabel, bool cancel) {
     M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextDatum(top_left);
     M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
     M5.Display.setTextSize(1);
     M5.Display.drawString(title, 6, 4);
 
-    // text field
-    M5.Display.drawRoundRect(6, 18, 308, 30, 4, TFT_DARKGREY);
+    // Optional right-aligned label (e.g. the network the password is for).
+    if (rightLabel && rightLabel[0]) {
+        String nm = rightLabel;
+        if (nm.length() > 30) nm = nm.substring(0, 30);
+        M5.Display.setTextDatum(top_right);
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.drawString(nm, 314, 4);
+        M5.Display.setTextDatum(top_left);
+    }
+
+    // text field + right-side buttons (show/hide, Back), sized to fit
+    int fieldW = kbFieldW(password, cancel);
+    M5.Display.drawRoundRect(6, 18, fieldW, 30, 4, TFT_DARKGREY);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.setTextSize(2);
     M5.Display.setTextDatum(middle_left);
     String shown = buf;
-    if (password) { shown = ""; for (size_t i = 0; i < buf.length(); i++) shown += '*'; }
-    if (shown.length() > 24) shown = shown.substring(shown.length() - 24);
+    if (password && !reveal) { shown = ""; for (size_t i = 0; i < buf.length(); i++) shown += '*'; }
+    size_t maxShown = fieldW / 13; if (maxShown < 8) maxShown = 8;
+    if (shown.length() > maxShown) shown = shown.substring(shown.length() - maxShown);
     M5.Display.drawString(shown + "_", 12, 33);
+    if (password) button(kbEyeX(password, cancel),  KB_BTN_Y, KB_BTN_W, KB_BTN_H, reveal ? "hide" : "show", TFT_NAVY);
+    if (cancel)   button(kbBackX(password, cancel), KB_BTN_Y, KB_BTN_W, KB_BTN_H, "back", TFT_MAROON);
 
     // character rows
     const char* const* rows = kbRows(mode);
@@ -217,12 +266,25 @@ static void drawKeyboard(const char* title, const String& buf, bool password, in
     button(270, fy, 50, 240 - fy, "OK",  TFT_DARKGREEN);
 }
 
-String keyboard(const char* title, bool password) {
+String keyboard(const char* title, bool password, const char* rightLabel, bool* cancelled) {
     String buf;
     int mode = 0;     // 0 lower, 1 upper, 2 symbols
-    drawKeyboard(title, buf, password, mode);
+    bool reveal = false;
+    bool back = (cancelled != nullptr);     // show a Back button when the caller can handle it
+    drawKeyboard(title, buf, password, reveal, mode, rightLabel, back);
     while (true) {
         int x, y; waitTap(x, y);
+        // Show/hide toggle (password fields only) - reveal the typed text.
+        if (password && hit(x, y, kbEyeX(password, back), KB_BTN_Y, KB_BTN_W, KB_BTN_H)) {
+            reveal = !reveal;
+            drawKeyboard(title, buf, password, reveal, mode, rightLabel, back);
+            continue;
+        }
+        // Back/cancel - abandon entry and tell the caller (e.g. wrong network).
+        if (back && hit(x, y, kbBackX(password, back), KB_BTN_Y, KB_BTN_W, KB_BTN_H)) {
+            if (cancelled) *cancelled = true;
+            return "";
+        }
         int fy = KB_TOP + 4 * ROW_H;
         if (y >= fy) {                                    // function row
             if      (x < 50)  mode = (mode == 1) ? 0 : 1; // shift
@@ -243,7 +305,7 @@ String keyboard(const char* title, bool password) {
                 }
             }
         }
-        drawKeyboard(title, buf, password, mode);
+        drawKeyboard(title, buf, password, reveal, mode, rightLabel, back);
     }
 }
 
@@ -274,6 +336,40 @@ Facing askFacing() {
         if (hit(x, y, 120, 194, 80, 40)) return FACE_SOUTH;
         if (hit(x, y, 14,  140, 90, 40)) return FACE_WEST;
     }
+}
+
+void drawCompassCal(float progress) {
+    if (progress < 0) progress = 0;
+    if (progress > 1) progress = 1;
+    static uint32_t last = 0;
+    uint32_t nowMs = millis();
+    if (nowMs - last < 120) return;     // throttle redraws (called in a tight loop)
+    last = nowMs;
+
+    bool done = progress >= (float)COMPASS_CAL_SECTORS / 12.0f;
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("Calibrating", 160, 38);
+    M5.Display.drawString("compass", 160, 62);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString("Slowly rotate me through", 160, 102);
+    M5.Display.drawString("a full turn, then tilt around", 160, 116);
+
+    int x = 40, y = 150, w = 240, h = 22;
+    M5.Display.drawRoundRect(x, y, w, h, 4, TFT_DARKGREY);
+    int fw = (int)((w - 4) * progress);
+    M5.Display.fillRoundRect(x + 2, y + 2, fw, h - 4, 3, done ? TFT_GREEN : TFT_CYAN);
+
+    char b[8]; snprintf(b, sizeof b, "%d%%", (int)(progress * 100));
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString(b, 160, 192);
+    M5.Display.setTextColor(done ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString(done ? "good - tap to finish" : "tap to finish", 160, 222);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +411,28 @@ static void fmtClock(time_t utc, char* out) {
                 tmv.tm_sec, sg, ao / 60);
 }
 
+// Local date (YYYY-MM-DD) for the footer, using the same tz offset as the clock.
+static void fmtDate(time_t utc, char* out) {
+    time_t local = utc + (time_t)settings.tzOffsetMin * 60;
+    struct tm tmv; gmtime_r(&local, &tmv);
+    sprintf(out, "%04d-%02d-%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+}
+
+// Battery % centered at (160,y): red when low, green when charging. Skips if unknown.
+static void drawBatteryCentered(LovyanGFX& g, int y, uint16_t bg) {
+    int lvl = M5.Power.getBatteryLevel();
+    if (lvl < 0) return;
+    bool charging = (M5.Power.isCharging() == m5::Power_Class::is_charging);
+    char b[16]; sprintf(b, "batt %d%%%s", lvl, charging ? " +" : "");
+    g.setTextSize(1);
+    g.setTextDatum(top_center);
+    // Low + not actively charging (discharging OR unknown) -> red, matching the
+    // conservative direction the relax guard uses; only real charging shows green.
+    g.setTextColor((lvl < LOW_BATT_PCT && !charging) ? TFT_RED
+                   : (charging ? TFT_GREENYELLOW : TFT_LIGHTGREY), bg);
+    g.drawString(b, 160, y);
+}
+
 void drawTracking(const Target& t, float pan, float tilt,
                   bool inRange, time_t utc, int satCount) {
     LovyanGFX& g = hud ? hudG() : *(LovyanGFX*)&M5.Display;
@@ -346,9 +464,9 @@ void drawTracking(const Target& t, float pan, float tilt,
     };
     row("AZ",  String(t.az, 1) + (char)247, TFT_WHITE);
     row("EL",  String(t.el, 1) + (char)247, t.el > 0 ? TFT_GREEN : TFT_RED);
-    row("RNG", String((int)(t.rangeKm * KM_TO_MI)) + "mi", TFT_WHITE);
-    row("ALT", String((int)(t.altKm  * KM_TO_MI)) + "mi", TFT_WHITE);
-    row("VEL", String(t.velKms, 2),          TFT_WHITE);
+    row("RNG", String((int)(t.rangeKm * KM_TO_MI)) + " mi", TFT_WHITE);
+    row("ALT", String((int)(t.altKm  * KM_TO_MI)) + " mi", TFT_WHITE);
+    row("VEL", String((int)(t.velKms * 3600.0 * KM_TO_MI)) + " mph", TFT_WHITE);
 
     // satellite identity icon (top-right) + type label
     SatIcon::Type it = SatIcon::classify(t.name);
@@ -378,6 +496,15 @@ void drawTracking(const Target& t, float pan, float tilt,
     sprintf(line, "pan %3d  tilt %2d", (int)pan, (int)tilt);
     g.drawString(line, 6, 204);
     g.drawString(clk, 6, 222);
+
+    // battery (above) + date, centered between the clock and the IP
+    drawBatteryCentered(g, 204, 0x10A2);
+    if (utc > 0) {
+        char dt[12]; fmtDate(utc, dt);
+        g.setTextColor(TFT_WHITE, 0x10A2);
+        g.setTextDatum(top_center);
+        g.drawString(dt, 160, 222);
+    }
 
     // right column: sat count, then the IP address in the bottom-right corner
     g.setTextDatum(top_right);
@@ -442,7 +569,7 @@ void drawSearching(time_t utc, int satCount, const Sky::NextPass& next) {
     g.setTextSize(2);
     g.drawString("Scanning the sky", 160, 28);
 
-    if (next.valid) {
+    if (next.valid) {                       // a reachable pass -> count down to it
         g.setTextColor(TFT_DARKGREY, TFT_BLACK);
         g.setTextSize(1);
         g.drawString("next pass", 160, 66);
@@ -462,19 +589,40 @@ void drawSearching(time_t utc, int satCount, const Sky::NextPass& next) {
         g.setTextColor(TFT_DARKGREY, TFT_BLACK);
         g.setTextSize(1);
         g.drawString(ml, 160, 180);
+    } else if (!next.inReach && next.name[0]) {  // passes exist, but none pointable
+        g.setTextColor(TFT_ORANGE, TFT_BLACK);
+        g.setTextSize(1);
+        g.drawString("next pass is out of reach:", 160, 80);
+        g.setTextColor(TFT_CYAN, TFT_BLACK);
+        g.setTextSize(2);
+        g.drawString(next.name, 160, 100);
+        g.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        g.setTextSize(1);
+        g.drawString("widen reach limits / check facing", 160, 132);
     } else {
         g.setTextColor(TFT_DARKGREY, TFT_BLACK);
         g.setTextSize(1);
         g.drawString("no upcoming passes in view", 160, 110);
     }
 
-    // footer: sat count + clock (left), IP (right)
+    // footer - row 1 (y208): sat count (left) + battery (centre).
     g.setTextSize(1);
     g.setTextColor(TFT_DARKGREY, TFT_BLACK);
     g.setTextDatum(top_left);
-    char line[40]; char clk[24]; fmtClock(utc, clk);
-    sprintf(line, "%d sats   %s", satCount, clk);
-    g.drawString(line, 6, 224);
+    char sl[16]; sprintf(sl, "%d sats", satCount);
+    g.drawString(sl, 6, 208);
+    drawBatteryCentered(g, 208, TFT_BLACK);
+    // row 2 (y224): clock (left) + date (centre) + IP (right) - clock alone is
+    // short enough that it no longer collides with the centred date.
+    char clk[24]; fmtClock(utc, clk);
+    g.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    g.setTextDatum(top_left);
+    g.drawString(clk, 6, 224);
+    if (utc > 0) {
+        char dt[12]; fmtDate(utc, dt);
+        g.setTextDatum(top_center);
+        g.drawString(dt, 160, 224);
+    }
     String ip = WiFi.localIP().toString();
     if (ip == "0.0.0.0") ip = "offline";
     g.setTextDatum(top_right);
